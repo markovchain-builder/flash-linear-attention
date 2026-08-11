@@ -74,12 +74,14 @@ def _chunk_delta_rule_wy_dqkw_fused_kernel(
     o_t = t0 + tl.arange(0, BT)
     m_t = o_t < T
 
-    p_beta = tl.make_block_ptr(beta, (T,), (H,), (t0,), (BT,), (0,))
-    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    p_beta = beta + o_t * H
+    b_beta = tl.load(p_beta, mask=m_t, other=0.0).to(tl.float32)
 
     # Existing prepare_wy_repr_bwd consumes A transposed.
-    p_A = tl.make_block_ptr(A, (BT, T), (1, H * BT), (0, t0), (BT, BT), (0, 1))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
+    o_A = tl.arange(0, BT)
+    m_A = (o_A[:, None] < BT) & m_t[None, :]
+    p_A = A + o_A[:, None] + o_t[None, :] * (H * BT)
+    b_A = tl.load(p_A, mask=m_A, other=0.0)
 
     b_ds = tl.zeros([BT, BT], dtype=tl.float32)
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
@@ -87,16 +89,18 @@ def _chunk_delta_rule_wy_dqkw_fused_kernel(
 
     # K-independent work: local dS plus the V-side WY backward contribution.
     for i_v in range(tl.cdiv(V, BV)):
-        p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
-        p_v_new = tl.make_block_ptr(v_new, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
-        p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
-        p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
-        p_dv2 = tl.make_block_ptr(dv2, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
+        o_v = i_v * BV + tl.arange(0, BV)
+        m_v = m_t[:, None] & (o_v[None, :] < V)
+        p_do = do + o_t[:, None] * (H * V) + o_v[None, :]
+        p_v_new = v_new + o_t[:, None] * (H * V) + o_v[None, :]
+        p_v = v + o_t[:, None] * (H * V) + o_v[None, :]
+        p_dv = dv + o_t[:, None] * (H * V) + o_v[None, :]
+        p_dv2 = dv2 + o_t[:, None] * (H * V) + o_v[None, :]
 
-        b_do = tl.load(p_do, boundary_check=(0, 1))
-        b_v_new = tl.load(p_v_new, boundary_check=(0, 1))
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_dv = tl.load(p_dv, boundary_check=(0, 1))
+        b_do = tl.load(p_do, mask=m_v, other=0.0)
+        b_v_new = tl.load(p_v_new, mask=m_v, other=0.0)
+        b_v = tl.load(p_v, mask=m_v, other=0.0)
+        b_dv = tl.load(p_dv, mask=m_v, other=0.0)
 
         b_ds += tl.dot(b_do, tl.trans(b_v_new))
         b_dA += tl.dot(b_dv, tl.trans(b_v))
@@ -104,33 +108,38 @@ def _chunk_delta_rule_wy_dqkw_fused_kernel(
         b_dvb = tl.dot(b_A, b_dv)
         b_dv2 = b_dvb * b_beta[:, None]
         b_dbeta += tl.sum(b_dvb * b_v, 1)
-        tl.store(p_dv2, b_dv2.to(p_dv2.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_dv2, b_dv2.to(p_dv2.dtype.element_ty), mask=m_v)
 
     m_lower = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t[None, :])
     b_ds = tl.where(m_lower, b_ds, 0).to(q.dtype.element_ty)
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (t0, i_k * BK), (BT, BK), (1, 0))
-        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (t0, i_k * BK), (BT, BK), (1, 0))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_q = tl.load(p_q, boundary_check=(0, 1))
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = m_t[:, None] & (o_k[None, :] < K)
+        p_k = k + o_t[:, None] * (H * K) + o_k[None, :]
+        p_q = q + o_t[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_k, other=0.0)
+        b_q = tl.load(p_q, mask=m_k, other=0.0)
 
         b_dq = tl.zeros([BT, BK], dtype=tl.float32)
         b_dk = tl.zeros([BT, BK], dtype=tl.float32)
         b_dw = tl.zeros([BT, BK], dtype=tl.float32)
 
         for i_v in range(tl.cdiv(V, BV)):
-            p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
-            p_v_new = tl.make_block_ptr(v_new, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
-            p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (t0, i_v * BV), (BT, BV), (1, 0))
-            p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-            p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+            o_v = i_v * BV + tl.arange(0, BV)
+            m_v = m_t[:, None] & (o_v[None, :] < V)
+            m_h = (o_v[:, None] < V) & (o_k[None, :] < K)
+            p_do = do + o_t[:, None] * (H * V) + o_v[None, :]
+            p_v_new = v_new + o_t[:, None] * (H * V) + o_v[None, :]
+            p_dv = dv + o_t[:, None] * (H * V) + o_v[None, :]
+            p_h = h + o_v[:, None] + o_k[None, :] * V
+            p_dh = dh + o_v[:, None] + o_k[None, :] * V
 
-            b_do = tl.load(p_do, boundary_check=(0, 1))
-            b_v_new = tl.load(p_v_new, boundary_check=(0, 1))
-            b_dv = tl.load(p_dv, boundary_check=(0, 1))
-            b_h = tl.load(p_h, boundary_check=(0, 1))
-            b_dh = tl.load(p_dh, boundary_check=(0, 1))
+            b_do = tl.load(p_do, mask=m_v, other=0.0)
+            b_v_new = tl.load(p_v_new, mask=m_v, other=0.0)
+            b_dv = tl.load(p_dv, mask=m_v, other=0.0)
+            b_h = tl.load(p_h, mask=m_h, other=0.0)
+            b_dh = tl.load(p_dh, mask=m_h, other=0.0)
 
             b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
             b_dk += tl.dot(b_v_new, b_dh.to(b_v_new.dtype))
@@ -147,10 +156,10 @@ def _chunk_delta_rule_wy_dqkw_fused_kernel(
         b_dbeta += tl.sum(b_dk_beta * b_k, 1)
         b_dk += b_dk_beta * b_beta[:, None]
 
-        p_dq = tl.make_block_ptr(dq, (T, K), (H * K, 1), (t0, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (t0, i_k * BK), (BT, BK), (1, 0))
-        tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+        p_dq = dq + o_t[:, None] * (H * K) + o_k[None, :]
+        p_dk = dk + o_t[:, None] * (H * K) + o_k[None, :]
+        tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), mask=m_k)
+        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=m_k)
 
     m_strict = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t[None, :])
     b_dA = tl.where(m_strict, b_dA * b_beta[None, :], 0)
@@ -161,20 +170,22 @@ def _chunk_delta_rule_wy_dqkw_fused_kernel(
     # Final transformed-dA terms for dk/dbeta. This stays in the fused launch,
     # avoiding the separate prepare_wy_repr_bwd + dk.add_ HBM round trip.
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (t0, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (t0, i_k * BK), (BT, BK), (1, 0))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_dk = tl.load(p_dk, boundary_check=(0, 1))
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = m_t[:, None] & (o_k[None, :] < K)
+        p_k = k + o_t[:, None] * (H * K) + o_k[None, :]
+        p_dk = dk + o_t[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_k, other=0.0)
+        b_dk = tl.load(p_dk, mask=m_k, other=0.0)
         b_k_beta = (b_k * b_beta[:, None]).to(b_k.dtype)
 
         b_dk_beta = tl.dot(b_dA.to(b_k.dtype), b_k)
         b_dbeta += tl.sum(b_dk_beta * b_k, 1)
         b_dk += safe_dot(tl.trans(b_dA.to(b_k.dtype)), b_k_beta, allow_tf32=False)
         b_dk += b_dk_beta * b_beta[:, None]
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=m_k)
 
-    p_dbeta = tl.make_block_ptr(dbeta, (T,), (H,), (t0,), (BT,), (0,))
-    tl.store(p_dbeta, b_dbeta.to(p_dbeta.dtype.element_ty), boundary_check=(0,))
+    p_dbeta = dbeta + o_t * H
+    tl.store(p_dbeta, b_dbeta.to(p_dbeta.dtype.element_ty), mask=m_t)
 
 
 def chunk_delta_rule_wy_dqkw_fused_triton(
